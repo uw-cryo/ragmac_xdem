@@ -5,33 +5,37 @@ import geoutils as gu
 import numpy as np
 import datetime
 import matplotlib
+from matplotlib import pyplot as plt
+from matplotlib import animation
+from IPython.display import HTML
 import psutil
+import multiprocessing as mp
+import rioxarray
+import xarray as xr
 
 ###########
 """
 From ragmac_xdem/data/raw/convert_dates.py
-
 @author: brunbarf
 """
 
 def convert_date_time_to_decimal_date(date_time):
-        """
+    """
     This function converts a date and a time to a decimal date value
     Inputs:
     - date_time: datetime object
     
     Outputs:
     - decimal_date_float: float
-
     """
-        hourdec=(date_time.hour + date_time.minute/60. + date_time.second/3600.)/24.
-        doy = date_time.timetuple().tm_yday
-        decimal_date = date_time.year + (doy+hourdec)/365.25
-        decimal_date = float('{:.8f}'.format(decimal_date))
-        return decimal_date
+    hourdec=(date_time.hour + date_time.minute/60. + date_time.second/3600.)/24.
+    doy = date_time.timetuple().tm_yday
+    decimal_date = date_time.year + (doy+hourdec)/365.25
+    decimal_date = float('{:.8f}'.format(decimal_date))
+    return decimal_date
     
 def convert_decimal_date_to_date_time(decimal_date):
-        """
+    """
     This function converts a decimal date and a date and time
     Inputs:
     - decimal_date: float
@@ -40,28 +44,52 @@ def convert_decimal_date_to_date_time(decimal_date):
     - date_time: datetime object
     - date_time_string: formated string from the datetime object
     """
-        decimal_date = float('{:.8f}'.format(decimal_date))
-        year = np.floor(decimal_date)
-        decimal_day = (decimal_date - np.floor(decimal_date))*365.25
-        doy = np.floor(decimal_day)
-        decimal_time = (decimal_day - doy)*24.
-        hour = np.floor(decimal_time)
-        minute = np.floor((decimal_time - hour)*60.)
-        second = (decimal_time - hour - minute/60.)*3660.
-        raw_str = str(int(year))+'{0:03d}'.format(int(doy))+'{0:02d}'.format(int(hour))+'{0:02d}'.format(int(minute))+'{0:02d}'.format(int(second))
-        date_time = datetime.datetime.strptime(raw_str, '%Y%j%H%M%S')
-        date_time_string=date_time.strftime('%Y-%m-%d %H:%M:%S')
-        return date_time, date_time_string
-    
+    decimal_date = float('{:.8f}'.format(decimal_date))
+    year = np.floor(decimal_date)
+    decimal_day = (decimal_date - np.floor(decimal_date))*365.25
+    doy = np.floor(decimal_day)
+    decimal_time = (decimal_day - doy)*24.
+    hour = np.floor(decimal_time)
+    minute = np.floor((decimal_time - hour)*60.)
+    second = np.floor((decimal_time - hour - minute/60.)*3660.)
+    #Hack to deal with Baltoro case 2008.78368507 which results in 60 seconds
+    if second == 60:
+        second = 59
+    raw_str = str(int(year))+'{0:03d}'.format(int(doy))+'{0:02d}'.format(int(hour))+'{0:02d}'.format(int(minute))+'{0:02d}'.format(int(second))
+    #print(raw_str)
+    date_time = datetime.datetime.strptime(raw_str, '%Y%j%H%M%S')
+    date_time_string=date_time.strftime('%Y-%m-%d %H:%M:%S')
+    return date_time, date_time_string
 
     
 
 ###########  
 """
 Modified from https://github.com/dshean/pygeotools/blob/master/pygeotools/lib/malib.py#L999
-
 @author: dshean
 """
+def calcperc(b, perc=(2.0,98.0)):
+    """Calculate values at specified percentiles
+    """
+    b = checkma(b)
+    if b.count() > 0:
+        #low = scoreatpercentile(b.compressed(), perc[0])
+        #high = scoreatpercentile(b.compressed(), perc[1])
+        low = np.percentile(b.compressed(), perc[0])
+        high = np.percentile(b.compressed(), perc[1])
+    else:
+        low = 0
+        high = 0
+    return low, high
+
+def calcperc_sym(b, perc=(2.0,98.0)):
+    """
+    Get symmetrical percentile values
+    Useful for determining clim centered on 0 for difference maps
+    """
+    clim = np.max(np.abs(calcperc(b, perc)))
+    return -clim, clim
+
 def checkma(a, fix=False):
     #isinstance(a, np.ma.MaskedArray)
     if np.ma.is_masked(a):
@@ -200,7 +228,8 @@ def ma_linreg(ma_stack, dt_list, n_thresh=2, model='linear', dt_stack_ptp=None, 
                 if parallel:
                     import multiprocessing as mp
                     if n_cpu is None:
-                        n_cpu = psutil.cpu_count(logical=True)
+                        n_cpu = mp.cpu_count() - 1
+                        #n_cpu = psutil.cpu_count(logical=True)
                     n_cpu = int(n_cpu)
                     print("Running in parallel with %i processes" % n_cpu)
                     pool = mp.Pool(processes=n_cpu)
@@ -312,3 +341,141 @@ def ma_linreg(ma_stack, dt_list, n_thresh=2, model='linear', dt_stack_ptp=None, 
         slope *= 365.25
 
     return slope, intercept, detrended_std
+
+########### 
+"""
+@author: friedrichknuth
+"""
+
+### Plotting functions
+def check_if_number_even(n):
+    '''
+    checks if int n is an even number
+    '''
+    if (n % 2) == 0:
+        return True
+    else:
+        return False
+
+def make_number_even(n):
+    '''
+    adds 1 to int n if odd number
+    '''
+    if check_if_number_even(n):
+        return n
+    else:
+        return n +1
+
+def get_row_column(n):
+    '''
+    returns largest factor pair for int n
+    makes rows the larger number
+    '''
+    max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
+    rows = int(max(max_pair))
+    columns = int(min(max_pair))
+    
+    # in case n is odd
+    # check if you get a smaller pair by adding 1 to make number even
+    if not check_if_number_even(n):
+        n = make_number_even(n)
+        max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
+        alt_rows = int(max(max_pair))
+        alt_columns = int(min(max_pair))
+        
+        if (rows,columns) > (alt_rows, alt_columns):
+            return (alt_rows, alt_columns)
+        else:
+            return (rows,columns)
+    return (rows,columns)
+
+def plot_gallery(array_3d,
+                 titles_list = None,
+                 figsize = (10,15)):
+    
+    rows, columns = get_row_column(len(array_3d))
+    fig = plt.figure(figsize=(10,15))
+
+    for i in range(rows*columns):
+        try:
+            array = array_3d[i]
+            ax = plt.subplot(rows, columns, i + 1, aspect='auto')
+            ax.imshow(array,interpolation='none')
+            ax.set_xticks(())
+            ax.set_yticks(())
+            if titles_list:
+                ax.set_title(titles_list[i])
+        except:
+            pass
+
+def plot_timelapse(array, 
+                   figsize=(10,10),
+                   point= None,
+                   titles_list = None,
+                   frame_rate=200):
+    '''
+    array with shape (time, x, y)
+    '''
+    fig, ax = plt.subplots(figsize=(10,10))
+    im = ax.imshow(array[0,:,:],interpolation='none')
+    if point:
+        p, = ax.plot(point[0],point[1],marker='o',color='r')
+    plt.close()
+    
+    def vid_init():
+        im.set_data(array[0,:,:])
+        if point:
+            p.set_data(point[0],point[1])
+    def vid_animate(i):
+        im.set_data(array[i,:,:])
+        if point:
+            p.set_data(point[0],point[1])
+        if titles_list:
+            ax.set_title(titles_list[i])
+
+    anim = animation.FuncAnimation(fig, 
+                                   vid_animate, 
+                                   init_func=vid_init, 
+                                   frames=array.shape[0],
+                                   interval=frame_rate)
+    return HTML(anim.to_html5_video())
+
+def xr_read_tif(tif_file_path, 
+                chunks=1000, 
+                masked=True):
+    """
+    Reads in single or multi-band GeoTIFF as chunked dask array for lazy io.
+    Parameters
+    ----------
+    GeoTIFF_file_path : str
+    Returns
+    -------
+    ds : xarray.Dataset
+        Includes rioxarray extension to xarray.Dataset
+    """
+
+    da = rioxarray.open_rasterio(tif_file_path, chunks=chunks, masked=True)
+
+    # Extract bands and assign as variables in xr.Dataset()
+    ds = xr.Dataset()
+    for i, v in enumerate(da.band):
+        da_tmp = da.sel(band=v)
+        da_tmp.name = "band" + str(i + 1)
+
+        ds[da_tmp.name] = da_tmp
+
+    # Delete empty band coordinates.
+    # Need to preserve spatial_ref coordinate, even though it appears empty.
+    # See spatial_ref attributes under ds.coords.variables used by rioxarray extension.
+    del ds.coords["band"]
+
+    # Preserve top-level attributes and extract single value from value iterables e.g. (1,) --> 1
+    ds.attrs = da.attrs
+    for key, value in ds.attrs.items():
+        try:
+            if len(value) == 1:
+                ds.attrs[key] = value[0]
+        except TypeError:
+            pass
+
+    return ds
