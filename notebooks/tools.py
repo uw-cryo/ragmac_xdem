@@ -7,16 +7,27 @@ import datetime
 import matplotlib
 from matplotlib import pyplot as plt
 from matplotlib import animation
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from IPython.display import HTML
 import psutil
 import multiprocessing as mp
+import concurrent
 import rioxarray
 import xarray as xr
+from sklearn import linear_model
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
+from sklearn.gaussian_process.kernels import ExpSineSquared
+from sklearn.gaussian_process.kernels import RationalQuadratic
+from sklearn.gaussian_process.kernels import WhiteKernel
+import pandas as pd
 
 ###########
 """
 From ragmac_xdem/data/raw/convert_dates.py
 @author: brunbarf
+
+Modified by @friedrichknuth
 """
 
 def convert_date_time_to_decimal_date(date_time):
@@ -27,11 +38,12 @@ def convert_date_time_to_decimal_date(date_time):
     
     Outputs:
     - decimal_date_float: float
+    
     """
-    hourdec=(date_time.hour + date_time.minute/60. + date_time.second/3600.)/24.
-    doy = date_time.timetuple().tm_yday
-    decimal_date = date_time.year + (doy+hourdec)/365.25
-    decimal_date = float('{:.8f}'.format(decimal_date))
+    year_start   = datetime.date(date_time.year, 1, 1).toordinal()
+    year_end     = datetime.date(date_time.year+1, 1, 1).toordinal()
+    days_in_year = year_end - year_start
+    decimal_date = date_time.year + float(date_time.toordinal() - year_start) / days_in_year
     return decimal_date
     
 def convert_decimal_date_to_date_time(decimal_date):
@@ -44,24 +56,14 @@ def convert_decimal_date_to_date_time(decimal_date):
     - date_time: datetime object
     - date_time_string: formated string from the datetime object
     """
-    decimal_date = float('{:.8f}'.format(decimal_date))
-    year = np.floor(decimal_date)
-    decimal_day = (decimal_date - np.floor(decimal_date))*365.25
-    doy = np.floor(decimal_day)
-    decimal_time = (decimal_day - doy)*24.
-    hour = np.floor(decimal_time)
-    minute = np.floor((decimal_time - hour)*60.)
-    second = np.floor((decimal_time - hour - minute/60.)*3660.)
-    #Hack to deal with Baltoro case 2008.78368507 which results in 60 seconds
-    if second == 60:
-        second = 59
-    raw_str = str(int(year))+'{0:03d}'.format(int(doy))+'{0:02d}'.format(int(hour))+'{0:02d}'.format(int(minute))+'{0:02d}'.format(int(second))
-    #print(raw_str)
-    date_time = datetime.datetime.strptime(raw_str, '%Y%j%H%M%S')
-    date_time_string=date_time.strftime('%Y-%m-%d %H:%M:%S')
+    year       = int(np.floor(decimal_date))
+    year_start = datetime.date(year,1,1).toordinal()
+    year_end     = datetime.date(year+1,1,1).toordinal()
+    days_in_year = year_end - year_start
+    days_since_year_begin = (decimal_date - year)*days_in_year
+    date_time = datetime.date.fromordinal(int(np.floor(year_start + days_since_year_begin)))
+    date_time_string=date_time.strftime('%Y-%m-%d')
     return date_time, date_time_string
-
-    
 
 ###########  
 """
@@ -347,98 +349,29 @@ def ma_linreg(ma_stack, dt_list, n_thresh=2, model='linear', dt_stack_ptp=None, 
 @author: friedrichknuth
 """
 
-### Plotting functions
-def check_if_number_even(n):
-    '''
-    checks if int n is an even number
-    '''
-    if (n % 2) == 0:
-        return True
+###########  Wrangling functions
+def stack_raster_arrays(raster_files_list, parse_time_stamps=True):
+    arrays = []
+    dt_list = []
+
+    for i in raster_files_list[:]:
+        src = gu.georaster.Raster(i)
+        masked_array = src.data
+
+        arrays.append(masked_array)
+
+        if parse_time_stamps:
+            date_time = float(os.path.basename(i).split('_')[1])
+            dt_list.append(date_time)
+
+    ma_stack = np.ma.vstack(arrays)
+    if parse_time_stamps:
+        dt_list = [convert_decimal_date_to_date_time(i)[0] for i in dt_list]
+
+        return ma_stack, dt_list
+    
     else:
-        return False
-
-def make_number_even(n):
-    '''
-    adds 1 to int n if odd number
-    '''
-    if check_if_number_even(n):
-        return n
-    else:
-        return n +1
-
-def get_row_column(n):
-    '''
-    returns largest factor pair for int n
-    makes rows the larger number
-    '''
-    max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
-    rows = int(max(max_pair))
-    columns = int(min(max_pair))
-    
-    # in case n is odd
-    # check if you get a smaller pair by adding 1 to make number even
-    if not check_if_number_even(n):
-        n = make_number_even(n)
-        max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
-        alt_rows = int(max(max_pair))
-        alt_columns = int(min(max_pair))
-        
-        if (rows,columns) > (alt_rows, alt_columns):
-            return (alt_rows, alt_columns)
-        else:
-            return (rows,columns)
-    return (rows,columns)
-
-def plot_gallery(array_3d,
-                 titles_list = None,
-                 figsize = (10,15)):
-    
-    rows, columns = get_row_column(len(array_3d))
-    fig = plt.figure(figsize=(10,15))
-
-    for i in range(rows*columns):
-        try:
-            array = array_3d[i]
-            ax = plt.subplot(rows, columns, i + 1, aspect='auto')
-            ax.imshow(array,interpolation='none')
-            ax.set_xticks(())
-            ax.set_yticks(())
-            if titles_list:
-                ax.set_title(titles_list[i])
-        except:
-            pass
-
-def plot_timelapse(array, 
-                   figsize=(10,10),
-                   point= None,
-                   titles_list = None,
-                   frame_rate=200):
-    '''
-    array with shape (time, x, y)
-    '''
-    fig, ax = plt.subplots(figsize=(10,10))
-    im = ax.imshow(array[0,:,:],interpolation='none')
-    if point:
-        p, = ax.plot(point[0],point[1],marker='o',color='r')
-    plt.close()
-    
-    def vid_init():
-        im.set_data(array[0,:,:])
-        if point:
-            p.set_data(point[0],point[1])
-    def vid_animate(i):
-        im.set_data(array[i,:,:])
-        if point:
-            p.set_data(point[0],point[1])
-        if titles_list:
-            ax.set_title(titles_list[i])
-
-    anim = animation.FuncAnimation(fig, 
-                                   vid_animate, 
-                                   init_func=vid_init, 
-                                   frames=array.shape[0],
-                                   interval=frame_rate)
-    return HTML(anim.to_html5_video())
+        return ma_stack, None
 
 def xr_read_tif(tif_file_path, 
                 chunks=1000, 
@@ -479,3 +412,368 @@ def xr_read_tif(tif_file_path,
             pass
 
     return ds
+
+def mask_low_count_pixels(ma_stack, n_thresh = 3):
+    count = np.ma.masked_equal(ma_stack.count(axis=0), 0).astype(np.uint16).data
+    valid_mask_2D = (count >= n_thresh)
+    valid_data = ma_stack[:, valid_mask_2D]
+    return valid_data, valid_mask_2D
+
+###########  Plotting functions
+def plot_array_gallery(array_3d,
+                       titles_list = None,
+                       figsize = (10,15),
+                       vmin = None,
+                       vmax = None,
+                       cmap='viridis'):
+    
+    if not vmin:
+        vmin = np.nanmin(array_3d)+50
+    if not vmax:
+        vmax = np.nanmax(array_3d)-50
+    
+    rows, columns = get_row_column(len(array_3d))
+    fig = plt.figure(figsize=(10,15))
+
+    for i in range(rows*columns):
+        try:
+            array = array_3d[i]
+            ax = plt.subplot(rows, columns, i + 1, aspect='auto')
+            ax.imshow(array,interpolation='none',cmap=cmap, vmin=vmin,vmax=vmax)
+            ax.set_xticks(())
+            ax.set_yticks(())
+            if titles_list:
+                ax.set_title(titles_list[i])
+        except:
+            pass
+    plt.tight_layout()
+
+def plot_time_series_gallery(x_values,
+                             y_values,
+                             predictions_df_list=None,
+                             std_df_list=None,
+                             x_ticks_off=False,
+                             y_ticks_off=True,
+                             sharex = True,
+                             figsize=(10,10),
+                             legend=True,
+                             linestyle='-',
+                             legend_labels = ["Observations",]):
+        
+    rows, columns = get_row_column(len(x_values))
+    
+    fig = plt.figure(figsize=figsize)
+    axes = []
+    for i in range(rows*columns):
+        try:
+            x, y = x_values[i], y_values[i]
+            ax = plt.subplot(rows, columns, i + 1, aspect='auto')
+            ax.plot(x, y, marker='o',c='b', label=legend_labels[0])
+            if x_ticks_off:
+                ax.set_xticks(())
+            if y_ticks_off:
+                ax.set_yticks(())
+            axes.append(ax)
+        except:
+            pass
+    if not isinstance(predictions_df_list, type(None)):
+        for idx, df in enumerate(predictions_df_list):
+            try:
+                std_df = std_df_list[idx]
+            except:
+                std_df = None
+            
+            for i, series in df.iteritems():
+                ax = axes[i]
+                try:
+                    series.plot(ax=ax,c='C'+str(idx+1),label= legend_labels[idx+1])
+                except:
+                    series.plot(ax=ax,c='C'+str(idx+1),label= 'Observations')
+                if not isinstance(std_df, type(None)):
+                    x = series.index.values
+                    y = series.values
+                    std_prediction = std_df[i].values
+                    ax.fill_between(x,
+                                    y - 1.96 * std_prediction,
+                                    y + 1.96 * std_prediction,
+                                    alpha=0.2,
+                                    label=legend_labels[idx+1]+'_95_%conf',
+                                    color='C'+str(idx+1))
+    
+    if legend:
+        axes[0].legend()
+    if sharex:
+        for ax in axes[:-columns]:
+            ax.set_xticks(())
+    plt.tight_layout()
+    
+def plot_timelapse(array, 
+                   figsize=(10,10),
+                   points= None,
+                   titles_list = None,
+                   frame_rate=200,
+                   vmin = None,
+                   vmax = None,
+                   alpha = None):
+    '''
+    array with shape (time, x, y)
+    '''
+    if not vmin:
+        vmin = np.nanmin(array)+50
+    if not vmax:
+        vmax = np.nanmax(array)-50
+        
+    fig, ax = plt.subplots(figsize=(10,10))
+    im = ax.imshow(array[0,:,:],interpolation='none',alpha = alpha,vmin=vmin,vmax=vmax)
+    if points:
+        p, = ax.plot(points[0],points[1],marker='o',color='b',linestyle='none')
+    plt.close()
+    
+    def vid_init():
+        im.set_data(array[0,:,:])
+        if points:
+            p.set_data(points[0],points[1])
+    def vid_animate(i):
+        im.set_data(array[i,:,:])
+        if points:
+            p.set_data(points[0],points[1])
+        if titles_list:
+            ax.set_title(titles_list[i])
+
+    anim = animation.FuncAnimation(fig, 
+                                   vid_animate, 
+                                   init_func=vid_init, 
+                                   frames=array.shape[0],
+                                   interval=frame_rate)
+    return HTML(anim.to_html5_video())
+
+def plot_count_std(count_nmad_ma_stack,
+                   count_vmin = 1,
+                   count_vmax = 50,
+                   count_cmap = 'gnuplot',
+                   std_vmin = 0,
+                   std_vmax = 20,
+                   std_cmap = 'cividis',
+                   points = None,
+                   alpha = None,
+                   ticks_off = True,
+                   ):
+    
+    fig,axes = plt.subplots(1,2,figsize=(15,10))
+    
+    ax = axes[0]
+    cmap = plt.cm.get_cmap(count_cmap, count_vmax)
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    
+    plt.colorbar(ax.imshow(count_nmad_ma_stack[0],
+                           vmin=count_vmin,
+                           vmax=count_vmax,
+                           interpolation='none',
+                           cmap=cmap,
+                           alpha=alpha),
+                 cax=cax).set_label(label='DEM count',size=12)
+    if points:
+        p, = ax.plot(points[0],points[1],marker='o',color='b',linestyle='none')
+    
+    ax = axes[1]
+    cmap = plt.cm.get_cmap(std_cmap)
+    
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    
+    plt.colorbar(ax.imshow(count_nmad_ma_stack[1],
+                           vmin=std_vmin,
+                           vmax=std_vmax,
+                           interpolation='none',
+                           alpha=alpha,
+                          cmap=cmap),
+                 cax=cax).set_label(label='STD [m]',size=12)
+    
+    if points:
+        p, = ax.plot(points[0],points[1],marker='o',color='b',linestyle='none')
+
+    if ticks_off:
+        for ax in axes:
+            ax.set_xticks(())
+            ax.set_yticks(())
+        
+###########  Models
+
+def remove_nan_from_training_data(X_train, y_train_masked_array):
+    array = y_train_masked_array.data
+    mask = ~y_train_masked_array.mask                       
+    X_train = X_train[mask]
+    y_train = y_train_masked_array[mask]
+    return X_train, y_train
+
+
+def create_prediction_timeseries(start_date = '2000-01-01',
+                                 end_date = '2023-01-01',
+                                 dt ='M'):
+    #M  = monthly frequency
+    #3M = every 3 months
+    #6M = every 6 months
+    d = pd.date_range(start_date,end_date,freq=dt)
+    X = d.to_series().apply([convert_date_time_to_decimal_date]).values.squeeze()
+    return X
+
+def linreg_predict(X_train,
+                   y_train,
+                   X,
+                   method='TheilSen'):
+    
+    if method=='Linear':
+        m = linear_model.LinearRegression()
+        m.fit(X_train.squeeze()[:,np.newaxis], y_train.squeeze())
+        slope = m.coef_
+        intercept = m.intercept_
+        prediction = m.predict(X.squeeze()[:,np.newaxis])
+        
+    if method=='TheilSen':
+        m = linear_model.TheilSenRegressor()
+        m.fit(X_train.squeeze()[:,np.newaxis], y_train.squeeze())
+        slope = m.coef_
+        intercept = m.intercept_
+        prediction = m.predict(X.squeeze()[:,np.newaxis])
+        
+    if method=='RANSAC':
+        m = linear_model.RANSACRegressor()
+        m.fit(X_train.squeeze()[:,np.newaxis], y_train.squeeze())
+        slope = m.estimator_.coef_
+        intercept = m.estimator_.intercept_
+        prediction = m.predict(X.squeeze()[:,np.newaxis])
+    
+    return prediction, slope[0], intercept
+
+def linreg_run(args):
+    X_train, y_train_masked_array, X,  method = args
+    
+    X_train, y_train = remove_nan_from_training_data(X_train, y_train_masked_array)
+    prediction, slope, intercept = linreg_predict(X_train,
+                                                  y_train,
+                                                  X,
+                                                  method='Linear')
+    
+    return prediction
+
+def linreg_reshape_parallel_results(results, ma_stack, valid_mask_2D):
+    results_stack = []
+    for i in range(results.shape[1]):
+        m = np.ma.masked_all_like(ma_stack[0])
+        m[valid_mask_2D] = results[:,i]
+        results_stack.append(m)
+    results_stack = np.ma.stack(results_stack)
+    return results_stack
+
+def linreg_run_parallel(X_train, ma_stack, X, method='Linear'):
+    pool = mp.Pool(processes=psutil.cpu_count(logical=True))
+    args = [(X_train, ma_stack[:,i], X, method) for i in range(ma_stack.shape[1])]
+    results = pool.map(linreg_run, args)
+    return np.array(results)
+
+def GPR_kernel():
+    v = 10.0
+    long_term_trend_kernel = v**2 * RBF(length_scale=v)
+
+    seasonal_kernel = (
+        2.0 ** 2
+        * RBF(length_scale=100.0)
+        * ExpSineSquared(length_scale=1.0, periodicity=1.0, periodicity_bounds="fixed")
+    )
+
+    irregularities_kernel = 0.5 ** 2 * RationalQuadratic(length_scale=1.0, alpha=1.0)
+
+    noise_kernel = 0.1 ** 2 * RBF(length_scale=0.1) + WhiteKernel(
+        noise_level=0.1 ** 2, noise_level_bounds=(1e-5, 1e5)
+    )
+
+    kernel = (
+        long_term_trend_kernel + seasonal_kernel + irregularities_kernel + noise_kernel
+    )
+    return kernel
+
+def GPR_model(X_train, y_train, alpha=1e-10):
+    X_train = X_train.squeeze()[:,np.newaxis]
+    y_train = y_train.squeeze()
+    kernel = GPR_kernel()
+    
+    gaussian_process_model = GaussianProcessRegressor(kernel=kernel, 
+                                                      normalize_y=True,
+                                                      alpha=alpha,
+                                                      n_restarts_optimizer=9)
+    
+    gaussian_process_model = gaussian_process_model.fit(X_train, y_train)
+    
+    return gaussian_process_model
+
+def GPR_predict(gaussian_process_model, X):
+    X = X.squeeze()[:,np.newaxis]
+    mean_prediction, std_prediction = gaussian_process_model.predict(X, return_std=True)
+    
+    return mean_prediction, std_prediction
+
+def GPR_run(args):
+    X_train, y_train_masked_array, X,  method = args
+    X_train, y_train = remove_nan_from_training_data(X_train, y_train_masked_array)
+    gaussian_process_model = GPR_model(X_train, y_train, alpha=1e-10)
+    prediction, std_prediction = GPR_predict(gaussian_process_model, X)
+
+    return prediction
+
+def GPR_run_parallel(X_train, ma_stack, X, method='Linear'):
+    pool = mp.Pool(processes=psutil.cpu_count(logical=True))
+    args = [(X_train, ma_stack[:,i], X, method) for i in range(ma_stack.shape[1])]
+    results = pool.map(GPR_run, args)
+    return np.array(results)
+
+def GPR_reshape_parallel_results(results, ma_stack, valid_mask_2D):
+    results_stack = []
+    for i in range(results.shape[1]):
+        m = np.ma.masked_all_like(ma_stack[0])
+        m[valid_mask_2D] = results[:,i]
+        results_stack.append(m)
+    results_stack = np.ma.stack(results_stack)
+    return results_stack
+
+###########  Miscellaneous
+def check_if_number_even(n):
+    '''
+    checks if int n is an even number
+    '''
+    if (n % 2) == 0:
+        return True
+    else:
+        return False
+
+def make_number_even(n):
+    '''
+    adds 1 to int n if odd number
+    '''
+    if check_if_number_even(n):
+        return n
+    else:
+        return n +1
+
+def get_row_column(n):
+    '''
+    returns largest factor pair for int n
+    makes rows the larger number
+    '''
+    max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
+    rows = int(max(max_pair))
+    columns = int(min(max_pair))
+    
+    # in case n is odd
+    # check if you get a smaller pair by adding 1 to make number even
+    if not check_if_number_even(n):
+        n = make_number_even(n)
+        max_pair = max([(i, n / i) for i in range(1, int(n**0.5)+1) if n % i == 0])
+        alt_rows = int(max(max_pair))
+        alt_columns = int(min(max_pair))
+        
+        if (rows,columns) > (alt_rows, alt_columns):
+            return (alt_rows, alt_columns)
+        else:
+            return (rows,columns)
+    return (rows,columns)
